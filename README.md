@@ -8,6 +8,13 @@ Provider-specific behavior lives in small **adapters**. The shared engine handle
 probing, verdict caching, inventory updates and scheduling without knowing which provider it
 is talking to.
 
+## Why this exists
+
+OpenCode's model picker can keep models that are withdrawn, unentitled, non-chat, or simply stale
+in the provider's live API. This plugin reconciles the picker against the provider's own `/models`
+endpoint and probes candidates before offering them, so unavailable models disappear without
+removing models that only failed because of a timeout or rate limit.
+
 ## Verified adapters
 
 | Adapter | Provider | Dialect handled by the adapter |
@@ -52,6 +59,12 @@ Refused models are retried after **7 days**. Unlisted-but-working models are rec
   models disappear.
 
 ## Install
+
+From npm:
+
+```bash
+opencode plugin add opencode-model-refresh
+```
 
 From GitHub:
 
@@ -272,6 +285,12 @@ Disable the whole plugin:
 To disable one provider, remove its entry from the `providers` option. Removing the plugin
 restores the normal models.dev-driven behavior on the next reload; model entries declared in
 your own configuration are not deleted.
+
+## Development
+
+This project was developed with substantial AI assistance using OpenCode. Human review, testing,
+and final decisions were applied throughout, but contributors should expect an AI-assisted
+codebase and verify changes carefully.
 
 ## License
 
