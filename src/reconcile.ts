@@ -1,44 +1,46 @@
 import { mkdir, writeFile } from "node:fs/promises"
 import { dirname } from "node:path"
-import { writeFileSync } from "node:fs"
+import { mkdirSync, writeFileSync } from "node:fs"
+import { credentialOf, type ResolvedCredential } from "./credentials.ts"
+import { buildHistoryLines, isStaleHistoryError } from "./history.ts"
 import { PLUGIN_ID } from "./ids.ts"
 import { fetchModels, probe } from "./openai.ts"
+import { selectCandidateIDs } from "./selection.ts"
 import type { Adapter, NormalizedEntry, ProviderConfig } from "./types.ts"
 
-const REFUSED_RETRY_MS = 7 * 24 * 60 * 60 * 1000
-const UNLISTED_RECHECK_MS = 24 * 60 * 60 * 1000
-const PROBE_CONCURRENCY = 5
+const MAX_CATALOGUE_ENTRIES = 5000
 
 export function isGuarded(refusedCount: number, liveAttempts: number, liveOK: number): boolean {
   return refusedCount > 0 && liveAttempts > 0 && liveOK === 0
 }
 
-const idsOf = (model) => [model.modelID ?? model.id, model.id]
+const idsOf = (model: any) => [model.modelID ?? model.id, model.id]
 
 function displayName(id: string) {
-  return id
-    .split("/")
-    .pop()
+  return (id.split("/").pop() ?? id)
     .split("-")
     .map((part) => (/^[a-z]/.test(part) ? part[0].toUpperCase() + part.slice(1) : part))
     .join(" ")
 }
 
-function apiKeyOf(credential: any): string | undefined {
-  if (!credential) return undefined
-  if (typeof credential === "string") return credential
-  if (typeof credential !== "object") return undefined
-  for (const field of ["key", "apiKey", "token", "value", "secret"]) {
-    if (typeof credential[field] === "string" && credential[field]) return credential[field]
-  }
-  return undefined
-}
-
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+export async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return []
+  /**
+   * A missing, zero or non-numeric limit must not leave the results array
+   * partially filled: callers destructure every entry.
+   */
+  const workers = Math.max(
+    1,
+    Math.min(Number.isFinite(limit) && limit > 0 ? Math.trunc(limit) : 1, items.length),
+  )
   const results = new Array<R>(items.length)
   let index = 0
   await Promise.all(
-    Array.from({ length: Math.min(limit, items.length) }, async () => {
+    Array.from({ length: workers }, async () => {
       while (index < items.length) {
         const current = index++
         results[current] = await fn(items[current])
@@ -66,32 +68,60 @@ function decorate(model: any, entry?: NormalizedEntry) {
   return next
 }
 
-function makeModel(entry: NormalizedEntry, template: any, config: ProviderConfig) {
-  const context = entry.contextWindow && entry.contextWindow > 0 ? entry.contextWindow : 200000
-  const output = entry.outputLimit && entry.outputLimit > 0 ? entry.outputLimit : Math.min(32768, context)
+export function makeModel(
+  entry: NormalizedEntry,
+  template: any,
+  config: ProviderConfig,
+  catalog?: any,
+) {
+  const catalogContext =
+    Number.isInteger(catalog?.limit?.context) && catalog.limit.context > 0
+      ? catalog.limit.context
+      : undefined
+  const catalogOutput =
+    Number.isInteger(catalog?.limit?.output) && catalog.limit.output > 0
+      ? catalog.limit.output
+      : undefined
+  const context =
+    entry.contextWindow && entry.contextWindow > 0
+      ? entry.contextWindow
+      : (catalogContext ?? 200000)
+  const output =
+    entry.outputLimit && entry.outputLimit > 0
+      ? entry.outputLimit
+      : (catalogOutput ?? Math.min(32768, context))
+  const capabilities = catalog?.capabilities ?? {}
   return {
+    ...(catalog ?? {}),
     id: entry.id,
     modelID: entry.id,
     providerID: config.providerID,
     type: "chat",
-    family: entry.family ?? entry.id.split("/")[0],
-    name: entry.name ?? displayName(entry.id),
-    package: template?.package,
-    settings: template?.settings,
+    family: entry.family ?? catalog?.family ?? entry.id.split("/")[0],
+    name: entry.name ?? catalog?.name ?? displayName(entry.id),
+    package: template?.package ?? catalog?.package,
+    settings: template?.settings ?? catalog?.settings,
     compatibility: {
+      ...(catalog?.compatibility ?? {}),
       ...(template?.compatibility ?? {}),
       reasoningField: config.reasoningField,
     },
     capabilities: {
-      tools: entry.tools ?? true,
-      input: entry.vision ? ["text", "image"] : ["text"],
-      output: ["text"],
-      temperature: true,
+      ...capabilities,
+      tools: entry.tools ?? capabilities.tools ?? true,
+      input:
+        entry.vision === true
+          ? ["text", "image"]
+          : entry.vision === false
+            ? ["text"]
+            : (capabilities.input ?? ["text"]),
+      output: capabilities.output ?? ["text"],
+      temperature: capabilities.temperature ?? true,
     },
-    variants: [],
-    time: { released: (entry.created ?? 0) * 1000 },
-    cost: [],
-    status: "active",
+    variants: catalog?.variants ?? [],
+    time: entry.created ? { released: entry.created * 1000 } : (catalog?.time ?? { released: 0 }),
+    cost: catalog?.cost ?? [],
+    status: catalog?.status ?? "active",
     enabled: true,
     limit: { context, output },
   }
@@ -125,27 +155,20 @@ export async function startReconciler(ctx: any, adapter: Adapter, config: Provid
   const historyPath = `${dirname(config.statusPath)}/changes.txt`
   const writeHistory = () => {
     try {
-      const lines: string[] = []
-      for (const entry of state.history as any[]) {
-        const summary = [`${entry.at}: +${entry.added.length} -${entry.removed.length}`]
-        if (entry.guarded) summary.push("guard")
-        if (entry.error) summary.push(`error: ${entry.error}`)
-        lines.push(summary.join(" | "))
-        for (const id of entry.added) lines.push(`+ ${id}`)
-        for (const id of entry.removed) lines.push(`- ${id}`)
-      }
+      mkdirSync(dirname(historyPath), { recursive: true })
+      const lines = buildHistoryLines(state.history, state.lastGood)
       writeFileSync(historyPath, `${lines.join("\n")}\n`)
     } catch {
       // History reporting must never affect reconciliation.
     }
   }
 
-  const resolveApiKey = async (): Promise<string | undefined> => {
+  const resolveCredential = async (): Promise<ResolvedCredential | undefined> => {
     try {
       const connection = await ctx.integration.connection.active(config.integrationID)
       if (connection) {
-        const key = apiKeyOf(await ctx.integration.connection.resolve(connection))
-        if (key) return key
+        const credential = credentialOf(await ctx.integration.connection.resolve(connection))
+        if (credential) return credential
       }
     } catch {
       // Fall through to provider settings.
@@ -153,13 +176,19 @@ export async function startReconciler(ctx: any, adapter: Adapter, config: Provid
     try {
       const result = await ctx.provider.get({ providerID: config.providerID })
       const provider = result?.data ?? result
-      return provider?.settings?.apiKey
+      const apiKey = provider?.settings?.apiKey
+      return typeof apiKey === "string" && apiKey ? { token: apiKey, oauth: false } : undefined
     } catch {
       return undefined
     }
   }
 
-  const persisted = await ctx.storage.get(config.storageKey)
+  let persisted: any
+  try {
+    persisted = await ctx.storage.get(config.storageKey)
+  } catch (error) {
+    console.warn(`${PLUGIN_ID}[${config.providerID}]: storage read failed: ${error}`)
+  }
   const persistedEntries = Array.isArray(persisted?.entries) ? persisted.entries : []
   const normalized = new Map<string, NormalizedEntry>()
   for (const entry of persistedEntries) {
@@ -174,13 +203,24 @@ export async function startReconciler(ctx: any, adapter: Adapter, config: Provid
   const rawHistory = Array.isArray(persisted?.history) ? persisted.history : []
   const history: any[] = []
   for (const entry of rawHistory) {
+    /**
+     * Drop errors produced by partially reloaded development builds so they
+     * never resurface in the timeline.
+     */
+    if (isStaleHistoryError(entry?.error)) continue
     if (history.some((existing) => sameHistory(existing, entry))) continue
     history.push(entry)
   }
   const state = {
-    apiKey: undefined as string | undefined,
+    token: undefined as string | undefined,
+    oauth: false,
     entries: persistedEntries,
     normalized,
+    catalogue: new Map<string, any>(
+      persisted?.catalogue && typeof persisted.catalogue === "object" && !Array.isArray(persisted.catalogue)
+        ? Object.entries(persisted.catalogue)
+        : [],
+    ),
     probes: persisted?.probes ?? {},
     lastGood: new Set<string>(Array.isArray(persisted?.offered) ? persisted.offered : []),
     offered: new Set<string>(Array.isArray(persisted?.offered) ? persisted.offered : []),
@@ -193,9 +233,33 @@ export async function startReconciler(ctx: any, adapter: Adapter, config: Provid
     ready: Boolean(persisted),
     guarded: false,
   }
+  const recordHistory = (entry: any) => {
+    if (isStaleHistoryError(entry?.error)) return
+    if (state.history.some((existing: any) => sameHistory(existing, entry))) return
+    state.history.unshift(entry)
+    if (state.history.length > 50) state.history.length = 50
+  }
+  const persist = async () => {
+    try {
+      await ctx.storage.set(config.storageKey, {
+        entries: state.entries,
+        probes: state.probes,
+        catalogue: Object.fromEntries(state.catalogue),
+        offered: [...state.lastGood],
+        history: state.history,
+      })
+    } catch (error) {
+      console.warn(`${PLUGIN_ID}[${config.providerID}]: storage write failed: ${error}`)
+    }
+  }
+  /**
+   * Ensure the change timeline file exists even before the first refresh, so
+   * observers and tooling can rely on its presence.
+   */
+  writeHistory()
   const verdictOf = (id: string) => state.probes[id]?.ok
 
-  await ctx.provider.transform((editor) => {
+  await ctx.provider.transform((editor: any) => {
     if (!state.ready) return
     const record = editor.get(config.providerID)
     if (!record) return
@@ -210,8 +274,8 @@ export async function startReconciler(ctx: any, adapter: Adapter, config: Provid
     if (state.guarded) {
       if (state.lastGood.size === 0) return
       const restored = existing
-        .filter((model) => state.lastGood.has(model.modelID ?? model.id))
-        .map((model) => decorate(model, state.normalized.get(model.modelID ?? model.id)))
+        .filter((model: any) => state.lastGood.has(model.modelID ?? model.id))
+        .map((model: any) => decorate(model, state.normalized.get(model.modelID ?? model.id)))
       if (restored.length === existing.length) return
       editor.models.set(config.providerID, restored)
       console.log(
@@ -243,9 +307,9 @@ export async function startReconciler(ctx: any, adapter: Adapter, config: Provid
      * rate-limited unless they have a definite refusal.
      */
     const additions = [...state.normalized.values()]
-      .filter((entry) => verdictOf(entry.id) === true || state.probes[entry.id]?.rateLimited === true)
-      .filter((entry) => !seen.has(entry.id))
-      .map((entry) => makeModel(entry, template, config))
+      .filter((entry: any) => verdictOf(entry.id) === true || state.probes[entry.id]?.rateLimited === true)
+      .filter((entry: any) => !seen.has(entry.id))
+      .map((entry: any) => makeModel(entry, template, config, state.catalogue.get(entry.id)))
 
     if (kept.length === existing.length && additions.length === 0) return
     editor.models.set(config.providerID, [...kept, ...additions])
@@ -259,43 +323,87 @@ export async function startReconciler(ctx: any, adapter: Adapter, config: Provid
   const run = async (force: boolean): Promise<RefreshSummary> => {
     const report: any = { at: new Date().toISOString(), provider: config.providerID, probed: {} }
     try {
-      state.apiKey = (await resolveApiKey()) ?? state.apiKey
-      if (!state.apiKey) {
+      const resolved =
+        (await resolveCredential()) ??
+        (state.token ? { token: state.token, oauth: state.oauth } : undefined)
+      if (!resolved) {
         const error = `no credential for ${config.integrationID}`
+        recordHistory({
+          at: new Date().toISOString(),
+          provider: config.providerID,
+          added: [],
+          removed: [],
+          error,
+        })
+        await persist()
+        writeHistory()
         await writeStatus({ ...report, error })
         return { provider: config.providerID, error }
       }
+      state.token = resolved.token
+      state.oauth = resolved.oauth
 
-      const entries = await fetchModels(config, state.apiKey)
-      const live = new Set(entries.map((entry) => entry.id))
+      const entries = await fetchModels(config, state.token)
+      const live = new Set<string>(entries.map((entry: any) => entry.id))
 
       const listed = await ctx.model.list()
       const activeModels = Array.isArray(listed) ? listed : (listed?.data ?? listed?.models ?? [])
+      const catalogue = new Map<string, any>()
+      /**
+       * Prefer this provider's own catalogue entries; fall back to another
+       * provider only when the same model ID is not available locally.
+       */
+      for (const model of activeModels) {
+        if (model.providerID !== config.providerID) continue
+        const id = model.modelID ?? model.id
+        if (typeof id === "string" && !catalogue.has(id)) catalogue.set(id, model)
+      }
+      for (const model of activeModels) {
+        const id = model.modelID ?? model.id
+        if (typeof id === "string" && !catalogue.has(id)) catalogue.set(id, model)
+      }
+      /**
+       * Merge the current catalogue into the persisted snapshot. Removed models
+       * keep their metadata for a future rediscovery. Same-provider entries win.
+       */
+      for (const [id, model] of catalogue) {
+        const existing = state.catalogue.get(id)
+        if (!existing || model.providerID === config.providerID) state.catalogue.set(id, model)
+      }
+      while (state.catalogue.size > MAX_CATALOGUE_ENTRIES) {
+        const oldest = state.catalogue.keys().next().value
+        if (oldest === undefined) break
+        state.catalogue.delete(oldest)
+      }
       const active = activeModels
-        .filter((model) => model.providerID === config.providerID)
+        .filter((model: any) => model.providerID === config.providerID)
         .flatMap(idsOf)
       const previousOffered = new Set(state.offered)
       state.offered = new Set([...state.offered, ...active])
+
+      /**
+       * Drop cached verdicts for models that are neither listed nor offered.
+       * They can no longer be reached by the candidate pool and would otherwise
+       * accumulate forever.
+       */
+      for (const id of Object.keys(state.probes)) {
+        if (!live.has(id) && !state.offered.has(id)) delete state.probes[id]
+      }
 
       /**
        * Adapters may narrow the probe pool, e.g. to a free tier. Offered models
        * are always included so withdrawn entries can be detected and removed.
        */
       const selected = adapter.select ? adapter.select(entries, state.offered) : entries
-      const candidatePool = new Set([...selected.map((entry) => entry.id), ...state.offered])
+      const candidatePool = new Set([...selected.map((entry: any) => entry.id), ...state.offered])
       const candidates = force
         ? [...candidatePool]
-        : [...candidatePool].filter((id) => {
-            const verdict = state.probes[id]
-            if (!verdict) return true
-            if (!verdict.ok) return Date.now() - verdict.at > REFUSED_RETRY_MS
-            return !live.has(id) && Date.now() - verdict.at > UNLISTED_RECHECK_MS
-          })
+        : selectCandidateIDs(candidatePool, state.probes, live)
 
-      const rateLimited = new Set<string>()
-      const verdicts = await mapLimit(candidates, PROBE_CONCURRENCY, async (id) => [
+      const rateLimited = new Map<string, number>()
+      const verdicts = await mapLimit(candidates, config.probeConcurrency, async (id) => [
         id,
-        await probe(config, adapter, state.apiKey!, id, rateLimited),
+        await probe(config, adapter, state.token!, id, rateLimited, state.oauth),
       ] as const)
 
       let okCount = 0
@@ -323,7 +431,12 @@ export async function startReconciler(ctx: any, adapter: Adapter, config: Provid
            * kept in the picker instead of being dropped as unproven.
            */
           if (rateLimited.has(id)) {
-            state.probes[id] = { ...(state.probes[id] ?? {}), rateLimited: true, at: Date.now() }
+            state.probes[id] = {
+              ...(state.probes[id] ?? {}),
+              rateLimited: true,
+              retryAt: rateLimited.get(id),
+              at: Date.now(),
+            }
           }
           continue // retry next cycle; change nothing
         }
@@ -336,9 +449,9 @@ export async function startReconciler(ctx: any, adapter: Adapter, config: Provid
        * Skip that rebuild. A cycle limited to unlisted models is allowed: that
        * is how genuinely withdrawn models are removed.
        */
-      state.guarded = isGuarded(refusedCount, liveAttempts, liveOK)
+      state.guarded = refusedCount > 0 && liveAttempts > 0 && liveOK === 0
       state.entries = entries
-      state.normalized = new Map(entries.map((entry) => [entry.id, adapter.normalize(entry)]))
+      state.normalized = new Map(entries.map((entry: any) => [entry.id, adapter.normalize(entry)]))
       state.ready = true
 
       await ctx.provider.reload()
@@ -347,35 +460,20 @@ export async function startReconciler(ctx: any, adapter: Adapter, config: Provid
         ? finalResponse
         : (finalResponse?.data ?? finalResponse?.models ?? [])
       const offered = finalModels
-        .filter((model) => model.providerID === config.providerID)
-        .map((model) => model.modelID ?? model.id)
-      const added = offered.filter((id) => !previousOffered.has(id))
-      const removed = [...previousOffered].filter((id) => !offered.includes(id))
-      const isDuplicate = state.history.some(
-        (entry: any) =>
-          entry?.provider === config.providerID &&
-          JSON.stringify(entry?.added ?? []) === JSON.stringify(added) &&
-          JSON.stringify(entry?.removed ?? []) === JSON.stringify(removed) &&
-          Boolean(entry?.guarded) === state.guarded &&
-          (entry?.error ?? undefined) === undefined,
-      )
-      if ((added.length || removed.length || state.guarded) && !isDuplicate) {
-        state.history.unshift({
-          at: new Date().toISOString(),
-          provider: config.providerID,
-          added,
-          removed,
-          guarded: state.guarded,
-        })
-        if (state.history.length > 50) state.history.length = 50
-      }
-      if (!state.guarded) state.lastGood = new Set(offered)
-      await ctx.storage.set(config.storageKey, {
-        entries: state.entries,
-        probes: state.probes,
-        offered: [...state.lastGood],
-        history: state.history,
+        .filter((model: any) => model.providerID === config.providerID)
+        .map((model: any) => model.modelID ?? model.id)
+      const added = offered.filter((id: string) => !previousOffered.has(id))
+      const removed = [...previousOffered].filter((id: string) => !offered.includes(id))
+      state.offered = new Set(offered)
+      recordHistory({
+        at: new Date().toISOString(),
+        provider: config.providerID,
+        added,
+        removed,
+        guarded: state.guarded,
       })
+      if (!state.guarded) state.lastGood = new Set(offered)
+      await persist()
       writeHistory()
 
       await writeStatus({
@@ -406,20 +504,14 @@ export async function startReconciler(ctx: any, adapter: Adapter, config: Provid
       }
     } catch (error) {
       console.warn(`${PLUGIN_ID}[${config.providerID}]: refresh failed: ${error}`)
-      state.history.unshift({
+      recordHistory({
         at: new Date().toISOString(),
         provider: config.providerID,
         added: [],
         removed: [],
         error: String(error),
       })
-      if (state.history.length > 50) state.history.length = 50
-      await ctx.storage.set(config.storageKey, {
-        entries: state.entries,
-        probes: state.probes,
-        offered: [...state.lastGood],
-        history: state.history,
-      })
+      await persist()
       writeHistory()
       await writeStatus({ ...report, error: String(error) })
       return { provider: config.providerID, error: String(error) }

@@ -35,9 +35,12 @@ export interface ProviderConfig {
   providerID: string
   integrationID: string
   baseURL: string
+  /** Provider-defined headers such as org or billing metadata. */
+  headers?: Record<string, string>
   userAgent?: string
   reasoningField: string
   refreshMinutes: number
+  probeConcurrency: number
   storageKey: string
   statusPath: string
 }

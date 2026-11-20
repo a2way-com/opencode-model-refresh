@@ -1,9 +1,13 @@
+import { RATE_LIMITED_BACKOFF_MS } from "./selection.ts"
 import type { Adapter, ProviderConfig, Verdict } from "./types.ts"
 
 const PROBE_TIMEOUT_MS = 30_000
+const INVENTORY_TIMEOUT_MS = 30_000
+const MAX_RATE_LIMIT_BACKOFF_MS = 24 * 60 * 60 * 1000
 
-function headers(config: ProviderConfig, apiKey: string, json = false) {
+export function requestHeaders(config: ProviderConfig, apiKey: string, json = false) {
   return {
+    ...(config.headers ?? {}),
     Authorization: `Bearer ${apiKey}`,
     ...(json ? { "Content-Type": "application/json" } : {}),
     /**
@@ -14,17 +18,48 @@ function headers(config: ProviderConfig, apiKey: string, json = false) {
   }
 }
 
+/**
+ * Respect Retry-After when the provider sends it; otherwise use the normal
+ * rate-limit backoff. Values are clamped to a sane range.
+ */
+function retryAfterMs(response: Response) {
+  const value = response.headers.get("retry-after")
+  if (value) {
+    const seconds = Number(value)
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return Math.min(MAX_RATE_LIMIT_BACKOFF_MS, Math.max(1000, seconds * 1000))
+    }
+    const date = Date.parse(value)
+    if (!Number.isNaN(date)) {
+      return Math.min(MAX_RATE_LIMIT_BACKOFF_MS, Math.max(1000, date - Date.now()))
+    }
+  }
+  return RATE_LIMITED_BACKOFF_MS
+}
+
 export async function fetchModels(config: ProviderConfig, apiKey: string) {
-  const response = await fetch(`${config.baseURL}/models`, {
-    headers: headers(config, apiKey),
-  })
-  if (!response.ok) throw new Error(`/models returned ${response.status}`)
-  const payload = await response.json()
-  const entries = (Array.isArray(payload?.data) ? payload.data : []).filter(
-    (entry) => typeof entry?.id === "string",
-  )
-  if (entries.length === 0) throw new Error("/models returned an empty inventory")
-  return entries
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), INVENTORY_TIMEOUT_MS)
+  try {
+    const response = await fetch(`${config.baseURL}/models`, {
+      signal: controller.signal,
+      headers: requestHeaders(config, apiKey),
+    })
+    if (!response.ok) throw new Error(`/models returned ${response.status}`)
+    const payload = await response.json()
+    const entries = (Array.isArray(payload?.data) ? payload.data : []).filter(
+      (entry: any) => typeof entry?.id === "string",
+    )
+    if (entries.length === 0) throw new Error("/models returned an empty inventory")
+    return entries
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`/models timed out after ${INVENTORY_TIMEOUT_MS}ms`)
+    }
+    throw error
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 /**
@@ -40,7 +75,8 @@ export async function probe(
   adapter: Adapter,
   apiKey: string,
   modelID: string,
-  rateLimited?: Set<string>,
+  rateLimits?: Map<string, number>,
+  oauth = false,
 ): Promise<Verdict> {
   const attempt = async (tokenField: string) => {
     const controller = new AbortController()
@@ -49,7 +85,7 @@ export async function probe(
       return await fetch(`${config.baseURL}/chat/completions`, {
         method: "POST",
         signal: controller.signal,
-        headers: headers(config, apiKey, true),
+        headers: requestHeaders(config, apiKey, true),
         body: JSON.stringify({
           model: modelID,
           messages: [{ role: "user", content: "Reply with exactly: OK" }],
@@ -67,7 +103,7 @@ export async function probe(
   let response = await attempt("max_tokens")
   if (!response) return undefined
   if (response.status === 429) {
-    rateLimited?.add(modelID)
+    rateLimits?.set(modelID, Date.now() + retryAfterMs(response))
     return undefined
   }
   if (response.ok) return true
@@ -76,12 +112,17 @@ export async function probe(
     response = await attempt("max_completion_tokens")
     if (!response) return undefined
     if (response.status === 429) {
-      rateLimited?.add(modelID)
+      rateLimits?.set(modelID, Date.now() + retryAfterMs(response))
       return undefined
     }
     if (response.ok) return true
     if (response.status === 400) return undefined
   }
 
+  /**
+   * An OAuth access token can expire; 401 then says nothing about the model's
+   * availability. Only API-key credentials treat 401 as a definite refusal.
+   */
+  if (oauth && response.status === 401) return undefined
   return adapter.classify(response.status)
 }

@@ -1,6 +1,7 @@
 import { Plugin } from "@opencode/plugin"
 import { nvidia } from "./adapters/nvidia"
 import { opencode } from "./adapters/opencode"
+import { resolveBinding } from "./binding.ts"
 import { PLUGIN_ID } from "./ids.ts"
 import { startReconciler } from "./reconcile.ts"
 import type { RefreshSummary } from "./reconcile.ts"
@@ -13,19 +14,27 @@ const adapters: Record<string, Adapter> = {
 }
 
 /**
+ * The provider definition. Its `integrationID` names the credential account
+ * and, when no adapter exists under the provider ID, the adapter dialect.
+ */
+async function providerDefinition(ctx: any, providerID: string): Promise<any> {
+  try {
+    const result = await ctx.provider.get({ providerID })
+    return result?.data ?? result
+  } catch {
+    // Not resolvable; the provider is skipped by the caller.
+    return undefined
+  }
+}
+
+/**
  * Endpoint from the provider definition itself, when it is a plain absolute
  * URL. Adapters never define endpoints, and neither do plugin options.
  */
-async function configuredBaseURL(ctx: any, providerID: string): Promise<string | undefined> {
-  try {
-    const result = await ctx.provider.get({ providerID })
-    const provider = result?.data ?? result
-    const baseURL = provider?.settings?.baseURL
-    if (typeof baseURL === "string" && /^https?:\/\//i.test(baseURL) && !baseURL.includes("${")) {
-      return baseURL
-    }
-  } catch {
-    // Not resolvable; the provider is skipped by the caller.
+function configuredBaseURL(provider: any): string | undefined {
+  const baseURL = provider?.settings?.baseURL
+  if (typeof baseURL === "string" && /^https?:\/\//i.test(baseURL) && !baseURL.includes("${")) {
+    return baseURL
   }
   return undefined
 }
@@ -77,11 +86,16 @@ export default Plugin.define({
       }
       seen.add(providerID)
 
-      /**
-       * The registry key is the adapter ID. An entry may override it to reuse
-       * a dialect under another provider.
-       */
-      const adapterID = entry.adapter ?? providerID
+      const provider = await providerDefinition(ctx, providerID)
+      const inferredIntegrationID =
+        typeof provider?.integrationID === "string" ? provider.integrationID : undefined
+      const { adapterID, integrationID } = resolveBinding({
+        providerID,
+        providerIntegrationID: inferredIntegrationID,
+        adapter: entry.adapter,
+        integrationID: entry.integrationID,
+        adapters,
+      })
       const adapter = adapters[adapterID]
       if (!adapter) {
         console.warn(
@@ -90,19 +104,32 @@ export default Plugin.define({
         continue
       }
 
-      const baseURL = await configuredBaseURL(ctx, providerID)
+      const baseURL = configuredBaseURL(provider)
       if (!baseURL) {
         console.warn(`${PLUGIN_ID}: no baseURL for provider "${providerID}"; skipping`)
         continue
       }
+      const refreshMinutes = Number(
+        entry.refreshMinutes ?? ctx.options.refreshMinutes ?? 60,
+      )
+      const probeConcurrency = Number(
+        entry.probeConcurrency ?? ctx.options.probeConcurrency ?? 5,
+      )
       const config: ProviderConfig = {
         adapterID,
         providerID,
-        integrationID: entry.integrationID ?? providerID,
+        integrationID,
         baseURL: String(baseURL).replace(/\/+$/, ""),
+        headers:
+          provider?.headers && typeof provider.headers === "object" ? provider.headers : undefined,
         userAgent: `opencode/${ctx.app.version}`,
         reasoningField: entry.reasoningField ?? "reasoning_content",
-        refreshMinutes: Number(entry.refreshMinutes ?? ctx.options.refreshMinutes ?? 60),
+        refreshMinutes:
+          Number.isFinite(refreshMinutes) && refreshMinutes > 0 ? refreshMinutes : 60,
+        probeConcurrency:
+          Number.isFinite(probeConcurrency) && probeConcurrency > 0
+            ? Math.trunc(probeConcurrency)
+            : 5,
         storageKey: `state:${providerID}`,
         statusPath:
           entry.statusPath ??
