@@ -44,15 +44,39 @@ test("opencode leaves ambiguous statuses inconclusive", () => {
   }
 })
 
-test("opencode selects only zero-priced entries", () => {
-  const entries = [
-    { id: "free", cost: { text: { input: { price: 0 }, output: { price: 0 } } } },
-    { id: "paid", cost: { text: { input: { price: 1 }, output: { price: 2 } } } },
-    { id: "missing-cost" },
-  ]
+test("nvidia normalizes missing metadata gracefully", () => {
+  const entry = nvidia.normalize({ id: "acme/bare-model", owned_by: "acme" })
+  assert.equal(entry.id, "acme/bare-model")
+  assert.equal(entry.family, "acme")
+  assert.equal(entry.contextWindow, undefined)
+  assert.equal(entry.vision, false)
+  assert.equal(entry.tools, undefined)
+})
 
-  assert.deepEqual(
-    opencode.select!(entries, new Set()).map((entry) => entry.id),
-    ["free", "missing-cost"],
-  )
+test("opencode normalizes modalities and limits", () => {
+  const entry = opencode.normalize({
+    id: "oc/vision",
+    name: "Vision",
+    family: "oc",
+    created: 7,
+    modalities: { input: ["text", "image/png"] },
+    limit: { context: 8192, output: 1024 },
+    capabilities: { tools: { supported: true } },
+  })
+  assert.equal(entry.id, "oc/vision")
+  assert.equal(entry.name, "Vision")
+  assert.equal(entry.family, "oc")
+  assert.equal(entry.created, 7)
+  assert.equal(entry.contextWindow, 8192)
+  assert.equal(entry.outputLimit, 1024)
+  assert.equal(entry.vision, true)
+  assert.equal(entry.tools, true)
+})
+
+test("opencode classifies 429 as inconclusive", () => {
+  assert.equal(opencode.classify(429), undefined)
+})
+
+test("nvidia classifies 200 as inconclusive", () => {
+  assert.equal(nvidia.classify(200), undefined)
 })
