@@ -20,14 +20,15 @@ removing models that only failed because of a timeout or rate limit.
 | Adapter | Provider | Dialect handled by the adapter |
 | --- | --- | --- |
 | `nvidia` | NVIDIA NIM (`integrate.api.nvidia.com`) | Sparse `context_window` / `model_type` metadata; `410 Gone` for withdrawn models; `404` for unentitled endpoints |
-| `opencode` | OpenCode hosted inference, free tier | models.dev-shaped metadata; User-Agent required by Cloudflare; free-only candidate selection; `429 FreeUsageLimitError` is not a refusal; region/auth failures are |
+| `opencode` | OpenCode hosted inference | models.dev-shaped metadata; User-Agent required by Cloudflare; `429 FreeUsageLimitError` is not a refusal; API-key `401` is a refusal, OAuth `401` is inconclusive |
 
 ## What each reconciliation cycle does
 
 1. Resolve the credential already attached to the provider, in this order:
-   - OpenCode's connection store for `integrationID`;
+   - OpenCode's connection store for `integrationID` (API key or OAuth access token);
    - `apiKey` in the provider's OpenCode settings.
-2. Fetch the provider's `/models` inventory.
+2. Fetch the provider's `/models` inventory, forwarding provider-defined headers such as org or
+   billing metadata.
 3. Probe models whose cached verdict is missing or due for recheck, using a minimal chat
    completion.
 4. Rebuild that provider's inventory:
@@ -41,11 +42,15 @@ removing models that only failed because of a timeout or rate limit.
 | Provider unreachable | **Nothing changes** |
 
 Existing catalogue and `opencode.json(c)` entries are reused for metadata when IDs match, so
-configured limits, reasoning variants and costs survive. New models receive generic metadata
-plus whatever the adapter can normalize.
+configured limits, reasoning variants and costs survive. Newly discovered models merge any
+matching models.dev catalogue entry (name, limits, costs, variants, capabilities) and then apply
+whatever the adapter can normalize. The merged catalogue is persisted with the verdict cache, so
+metadata survives restarts even after a model has been removed.
 
 Refused models are retried after **7 days**. Unlisted-but-working models are rechecked after
-**24 hours**. Inconclusive probes are retried on the next cycle and never cause removal.
+**24 hours**. Rate-limited models honor the provider's `Retry-After` header, falling back to
+**15 minutes**. Other inconclusive probes are retried on the next cycle. Inconclusive results
+never cause removal.
 
 ## Safety against provider dialect mismatches
 
@@ -55,6 +60,8 @@ Refused models are retried after **7 days**. Unlisted-but-working models are rec
 - A cycle in which live models are refused and none succeeds is treated as a possible dialect
   or authentication failure. The last successfully reconciled inventory is restored instead of
   emptying the picker or exposing the provider's raw catalogue.
+- With OAuth credentials, a `401` is **inconclusive** because the access token may have expired.
+  Only API-key credentials treat `401` as a definite refusal.
 - A cycle limited to unlisted models is still allowed to remove them; that is how withdrawn
   models disappear.
 
@@ -114,9 +121,9 @@ With no `providers` option, the plugin does nothing. Providers are never assumed
 double opt-in.
 
 Each provider needs a usable credential already attached to it. The plugin has no `apiKey` option
-and never stores credentials; it reuses OpenCode's connection store for `integrationID`, then
-`apiKey` in the provider's OpenCode settings. If none is found, reconciliation is skipped and the
-status report records why.
+and never stores credentials; it reuses OpenCode's connection store for `integrationID` (API keys
+and OAuth access tokens are both supported), then `apiKey` in the provider's OpenCode settings. If
+none is found, reconciliation is skipped and the status report records why.
 
 ## Options
 
@@ -125,10 +132,11 @@ Each item in `providers` accepts:
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `provider` | Required | OpenCode provider ID whose models are reconciled. |
-| `adapter` | Inferred from `provider` | Adapter ID from the registry. Required when reusing an adapter under a different provider ID. |
-| `integrationID` | `provider` | Integration used for credential lookup. |
+| `adapter` | Inferred from `provider`, then the provider definition's `integrationID` | Adapter ID from the registry. Required when reusing an adapter under a different provider ID. |
+| `integrationID` | Provider definition's `integrationID`, then `provider` | Integration used for credential lookup. |
 | `reasoningField` | `reasoning_content` | Reasoning field assigned to newly discovered models. |
 | `refreshMinutes` | `60` | Refresh interval for this provider. |
+| `probeConcurrency` | `5` | Maximum concurrent probes for this provider. |
 | `statusPath` | `~/.local/state/opencode/com.a2way.opencode-model-refresh/<providerID>/models.json` | Last-run report location. |
 
 Every provider gets an independent verdict cache, status file and timer.
@@ -148,8 +156,13 @@ Object form does the same and is useful when you need to override other fields:
 "providers": [{ "provider": "nvidia" }, { "provider": "opencode" }]
 ```
 
-A provider with no matching adapter is skipped with a warning. If `/api/provider` lists a
-provider but no adapter claims it, add the binding explicitly or add an adapter.
+When no adapter matches the provider ID, the provider definition's `integrationID` is used as the
+adapter ID and as the default credential account. This makes account-specific provider variants
+work without extra options: `opencode-go` uses the `opencode` integration and adapter.
+
+A provider with no matching adapter (directly or through `integrationID`) is skipped with a
+warning. If `/api/provider` lists a provider but no adapter claims it, add the binding explicitly
+or add an adapter.
 
 An **adapter describes a dialect, not one provider instance**. If a hypothetical provider
 uses NVIDIA-compatible metadata and error semantics, reuse the NVIDIA adapter under a new
@@ -180,9 +193,9 @@ The `acme` provider itself defines the endpoint in `opencode.json(c)`:
 ```
 
 This reconciles OpenCode's `acme` provider using the NVIDIA adapter. Credentials are looked up
-under `acme` unless `integrationID` says otherwise, and cache/status state is independent of the
-real NVIDIA provider. Only a provider with genuinely different dialect behavior needs a new
-adapter file.
+under the provider definition's `integrationID` (falling back to `acme`) unless `integrationID`
+says otherwise, and cache/status state is independent of the real NVIDIA provider. Only a
+provider with genuinely different dialect behavior needs a new adapter file.
 
 The endpoint comes only from the provider definition's `settings.baseURL`; neither adapters nor
 plugin options define endpoints. Bare shorthand such as `"providers": ["nvidia", "opencode"]`
@@ -194,17 +207,21 @@ define `settings.baseURL` in `opencode.json(c)`, otherwise it is skipped with a 
 ```
 src/
 ├── index.ts                 # option parsing, reconciler startup, RPC registration
+├── binding.ts               # adapter/integration inference
+├── credentials.ts           # API key and OAuth credential extraction
+├── history.ts               # changes.txt rendering
 ├── ids.ts                   # namespaced plugin, RPC and TUI identifiers
 ├── reconcile.ts             # provider-agnostic reconciliation engine
+├── selection.ts             # probe retry/backoff policy
 ├── openai.ts                # /models fetch and safe chat probing
-├── rpc.ts                   # refresh method shared by server, Desktop and TUI
-├── gui.tsx                  # Desktop commands, slash entries and toasts
-├── tui.ts                   # terminal /refresh-models command and toast
-├── summary.ts               # shared toast text
+├── rpc.ts                   # refresh/history methods shared by server, Desktop and TUI
+├── gui.tsx                  # Desktop commands, slash entries, toasts and dialogs
+├── tui.tsx                  # terminal commands, toasts and dialogs
+├── summary.ts               # shared toast and history text
 ├── types.ts                 # adapter contract and shared types
 └── adapters/
     ├── nvidia.ts            # NVIDIA metadata and status semantics
-    └── opencode.ts          # OpenCode free-tier dialect and selection
+    └── opencode.ts          # OpenCode hosted-inference dialect
 dist/
 └── gui-experimental.cjs     # prebuilt Desktop bundle (npm run build)
 ```
@@ -214,13 +231,14 @@ An adapter supplies only the dialect-specific pieces:
 ```ts
 {
   normalize(entry),          // provider JSON -> normalized model metadata
-  select(entries, offered),  // optional probe-pool restriction, e.g. free models only
+  select(entries, offered),  // optional probe-pool restriction for a provider tier
   classify(status),          // HTTP status -> true | false | undefined
 }
 ```
 
 The registry key is the adapter ID, so adapters carry no provider or integration defaults.
-`providerID` comes from the plugin entry, and `integrationID` defaults to it.
+`providerID` comes from the plugin entry. `integrationID` defaults to the provider definition's
+`integrationID`, then to the provider ID.
 
 To support another provider, add an adapter file and register it in `src/index.ts`. The
 engine does not need provider-specific edits, and no per-model allowlist is required.
@@ -231,8 +249,8 @@ provider definition and OpenCode's credential store, not from the adapter.
 ## Please read: this plugin makes requests on your accounts
 
 A probe is a real chat completion with `max_tokens: 1` (or the retry equivalent), with at most
-five probes concurrently per provider. After the initial pass, only new or due-for-recheck
-models are probed.
+five probes concurrently per provider by default (`probeConcurrency`). After the initial pass,
+only new or due-for-recheck models are probed.
 
 It also **removes models** when the provider definitely refuses them. This is intentional:
 withdrawn or unavailable catalogue entries should not remain selectable. Timeouts, rate limits
@@ -249,7 +267,11 @@ Use `/refresh-models-force` to re-probe every candidate, ignoring the 7-day refu
 the 24-hour unlisted recheck. Forced cycles still apply the wipe guard and probe concurrency
 limit; if the guard trips, the picker keeps its last successfully reconciled inventory.
 
-Both commands appear when you type `/` in the OpenCode Desktop composer and in the terminal
+Run `/refresh-models-history` to open a window with the recent timeline (additions, removals,
+`no change`, guard events and errors) from all configured providers. It only reads persisted
+history and does not start a refresh.
+
+The commands appear when you type `/` in the OpenCode Desktop composer and in the terminal
 prompt. They are also available from the command palette (`Ctrl+P` in the terminal; the Desktop
 command menu lists them under **Models**).
 
@@ -271,8 +293,10 @@ Last-run reports are written to:
 - `~/.local/state/opencode/com.a2way.opencode-model-refresh/<providerID>/models.json`
 - `~/.local/state/opencode/com.a2way.opencode-model-refresh/<providerID>/changes.txt` (newest first)
 
-They include probe verdicts, the actual offered model IDs, refused models, and whether the
-wipe guard skipped a rebuild.
+`models.json` includes probe verdicts, the actual offered model IDs, refused models, and whether
+the wipe guard skipped a rebuild. `changes.txt` is created even before the first refresh: it
+records added/removed models per cycle, marks cycles that changed nothing as `no change`, and
+falls back to a baseline inventory of the currently known models when no change history exists.
 
 ## Disable
 
@@ -287,6 +311,14 @@ restores the normal models.dev-driven behavior on the next reload; model entries
 your own configuration are not deleted.
 
 ## Development
+
+```bash
+npm run check     # typecheck, tests and bundle freshness
+npm test          # unit tests
+npm run typecheck # tsc --noEmit
+npm run build     # rebuild the Desktop bundle
+npm run check:dist # fail if the committed bundle is stale
+```
 
 This project was developed with substantial AI assistance using OpenCode. Human review, testing,
 and final decisions were applied throughout, but contributors should expect an AI-assisted
