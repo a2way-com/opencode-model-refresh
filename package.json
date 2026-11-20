@@ -25,6 +25,9 @@
   ],
   "scripts": {
     "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "check:dist": "npm run build && git diff --exit-code -- dist/gui-experimental.cjs",
+    "check": "npm run typecheck && npm test && npm run check:dist",
     "test": "node --experimental-strip-types --test 'test/**/*.test.ts'"
   },
   "keywords": [
@@ -39,7 +42,9 @@
     "@opencode/plugin": "^2.3.2"
   },
   "devDependencies": {
+    "@types/node": "^26.6.6",
     "solid-js": "^1.9.0",
+    "typescript": "^7.0.2",
     "vite": "^7.0.0",
     "vite-plugin-solid": "^2.11.0"
   }
